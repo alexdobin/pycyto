@@ -19,7 +19,12 @@ later ``pl.concat``).
 
 import polars as pl
 
-from pycyto.aggregate import _load_assignments_for_experiment_sample
+# Import the production constant so this test tracks the source of truth: if a
+# new per-guide column is added there, these dtype assertions cover it too.
+from pycyto.aggregate import (
+    _ASSIGNMENT_PER_GUIDE_COLS,
+    _load_assignments_for_experiment_sample,
+)
 
 # cyto's assignments.tsv schema (one row per CRISPR-detected cell).
 HEADER = [
@@ -36,13 +41,14 @@ HEADER = [
     "tested",
 ]
 
-# The per-guide columns that are pipe-delimited for MOI>1 cells.
-PER_GUIDE_COLS = ["assignment", "guide_ids_original", "umis", "fdr", "log_odds"]
+PER_GUIDE_COLS = list(_ASSIGNMENT_PER_GUIDE_COLS)
 
-# Push the first multi-guide row well past polars' default infer window (100),
-# so a naive ``read_csv`` infers the per-guide columns as numeric and then
-# crashes on the pipe-delimited value -- faithfully reproducing the GCP failure.
-N_SINGLE_GUIDE_ROWS = 150
+# Push the first multi-guide row well past any plausible ``infer_schema_length``
+# default (polars' is 100), so a naive ``read_csv`` infers the per-guide columns
+# as numeric and then crashes on the pipe-delimited value -- faithfully
+# reproducing the GCP failure. The String-dtype assertions below are independent
+# of this window, so they keep guarding the fix even if polars' default changes.
+N_SINGLE_GUIDE_ROWS = 1000
 
 
 def _write_assignments_tsv(path, *, with_multiguide: bool) -> None:
@@ -88,35 +94,40 @@ def _write_assignments_tsv(path, *, with_multiguide: bool) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
-def _load(tmp_path, *, with_multiguide: bool) -> pl.DataFrame:
+def _write_bc(tmp_path, bc: str, *, with_multiguide: bool) -> None:
     assignments_dir = tmp_path / "assignments"
-    assignments_dir.mkdir()
+    assignments_dir.mkdir(exist_ok=True)
     _write_assignments_tsv(
-        assignments_dir / "BC001.assignments.tsv", with_multiguide=with_multiguide
+        assignments_dir / f"{bc}.assignments.tsv", with_multiguide=with_multiguide
     )
-    dfs = _load_assignments_for_experiment_sample(
+
+
+def _load(tmp_path, bcs: list[str]) -> list[pl.DataFrame]:
+    return _load_assignments_for_experiment_sample(
         root=str(tmp_path),
-        crispr_bcs=["BC001"],
+        crispr_bcs=bcs,
         lane_id="1",
         experiment="E1",
         sample="S1",
     )
-    assert len(dfs) == 1
-    return dfs[0]
 
 
 def test_multiguide_assignments_load_without_crash(tmp_path):
     """A late multi-guide row must not crash the read; values survive intact."""
-    df = _load(tmp_path, with_multiguide=True)
+    _write_bc(tmp_path, "BC001", with_multiguide=True)
+    (df,) = _load(tmp_path, ["BC001"])
     assert df.height == N_SINGLE_GUIDE_ROWS + 1
-    # The pipe-delimited multi-guide values are preserved verbatim.
-    assert "65|129|262" in df["guide_ids_original"].to_list()
-    assert "2|6|3" in df["umis"].to_list()
+    # The pipe-delimited multi-guide values land on the right (multi-guide) row.
+    multi_row = df.filter(pl.col("cell") == "CELLMULTI-D-A01")
+    assert multi_row.height == 1
+    assert multi_row["guide_ids_original"].item() == "65|129|262"
+    assert multi_row["umis"].item() == "2|6|3"
 
 
 def test_per_guide_columns_are_strings(tmp_path):
     """Per-guide columns are read as String, deterministically (no numeric infer)."""
-    df = _load(tmp_path, with_multiguide=True)
+    _write_bc(tmp_path, "BC001", with_multiguide=True)
+    (df,) = _load(tmp_path, ["BC001"])
     for col in PER_GUIDE_COLS:
         assert df.schema[col] == pl.String, (
             f"{col} should be String, got {df.schema[col]}"
@@ -129,8 +140,29 @@ def test_per_guide_columns_uniform_dtype_for_single_guide_only_file(tmp_path):
     Otherwise it infers numeric dtypes and the later cross-barcode ``pl.concat``
     sees a mixed schema (some files i64, some String).
     """
-    df = _load(tmp_path, with_multiguide=False)
+    _write_bc(tmp_path, "BC001", with_multiguide=False)
+    (df,) = _load(tmp_path, ["BC001"])
     for col in PER_GUIDE_COLS:
         assert df.schema[col] == pl.String, (
             f"{col} should be String, got {df.schema[col]}"
         )
+
+
+def test_cross_file_concat_uniform_dtype(tmp_path):
+    """The aggregation's cross-barcode concat must not hit a mixed schema.
+
+    Mirrors ``_process_gex_crispr_set``'s ``pl.concat(..., how="vertical_relaxed")``
+    over per-barcode frames: one barcode with no multi-guide cell (which would
+    naively infer numeric) and one with multi-guide cells (which infers String).
+    This guard is independent of polars' inference window.
+    """
+    _write_bc(tmp_path, "BC001", with_multiguide=False)
+    _write_bc(tmp_path, "BC002", with_multiguide=True)
+    dfs = _load(tmp_path, ["BC001", "BC002"])
+    assert len(dfs) == 2
+    combined = pl.concat(dfs, how="vertical_relaxed")
+    for col in PER_GUIDE_COLS:
+        assert combined.schema[col] == pl.String, (
+            f"{col} should be String after concat, got {combined.schema[col]}"
+        )
+    assert "65|129|262" in combined["guide_ids_original"].to_list()
